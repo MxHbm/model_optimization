@@ -15,15 +15,12 @@ from sklearn.metrics import make_scorer, accuracy_score, f1_score, roc_auc_score
 from sklearn.metrics import matthews_corrcoef
 from sklearn.preprocessing import StandardScaler
 
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
 # ----------------- CONFIG -----------------
 INPUT_DIR   = r"C:\Users\mahu123a\Documents\Data\RandomDataGeneration_Gendreau"
 OUTPUT_DIR  = os.path.join(os.getcwd(),"FeatureSubsetResultsLR_JSON")
 LABEL_COL   = "CP Status"
 DROP_COLS   = ["filename", "Route"]           # columns to drop from features
-MAX_FEATURES = 30                              # cap
+MAX_FEATURES = 35                              # cap
 MIN_FEATURES = 5
 N_SPLITS     = 5                               # 5-fold CV
 RANDOM_STATE = 42
@@ -44,20 +41,12 @@ base_estimator = Pipeline(steps=[
 
 cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
-def binary_auc(y_true, y_score):
-    # y_score can be 1D or 2D; take positive class if 2D
-    if hasattr(y_score, "shape") and len(y_score.shape) == 2:
-        y_score = y_score[:, 1]
-    return roc_auc_score(y_true, y_score)
-
 scoring = {
-    "accuracy": make_scorer(accuracy_score),
-    "f1":       make_scorer(f1_score),
-    "roc_auc":  make_scorer(binary_auc, needs_proba=True),
-    "mcc":      make_scorer(matthews_corrcoef)
+    "accuracy": "accuracy",
+    "f1": "f1",
+    "roc_auc": "roc_auc",
+    "mcc": "matthews_corrcoef"
 }
-
-
 
 # ----------------- UTIL -----------------
 def safe_colnames(df: pd.DataFrame) -> pd.DataFrame:
@@ -67,23 +56,31 @@ def safe_colnames(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def evaluate_subset(X: pd.DataFrame, y: pd.Series, features: list[str]) -> dict:
-    """Return mean & std for each metric over CV using only 'features'."""
+    """Return per-fold, mean & std for each metric over CV using only 'features'."""
     res = cross_validate(
         base_estimator,
         X[features],
         y,
         cv=cv,
         scoring=scoring,
-        n_jobs=-1,
-        return_train_score=False
+        n_jobs=16,
+        return_train_score=False,
+        # error_score='raise',  # uncomment while debugging to see fold errors
     )
+
     out = {}
     for key, arr in res.items():
         if not key.startswith("test_"):
             continue
         metric = key.replace("test_", "")
-        out[metric] = {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=1))}
+        arr = np.asarray(arr, dtype=float)
+        out[metric] = {
+            "folds": [float(v) for v in arr],                  # ← per-fold values
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+        }
     return out
+
 
 def select_features_k(X: pd.DataFrame, y: pd.Series, k: int, metric:str) -> list[str]:
     """
@@ -102,7 +99,7 @@ def select_features_k(X: pd.DataFrame, y: pd.Series, k: int, metric:str) -> list
         direction="forward",
         scoring=scoring_fn,
         cv=cv,
-        n_jobs=-1
+        n_jobs=16
     )
     selector.fit(X, y)
     support = selector.get_support(indices=True)
@@ -114,7 +111,7 @@ def summarize_best(results_by_k: list[dict]) -> dict:
     find the best (highest mean) per metric.
     """
     best = {}
-    for metric in ["accuracy", "f1", "roc_auc"]:
+    for metric in ["accuracy", "f1", "roc_auc","mcc"]:
         best_entry = max(
             results_by_k,
             key=lambda d: d["scores"][metric]["mean"]
@@ -156,16 +153,27 @@ def process_dataset(csv_path: str) -> dict:
             "scores": scores_k
         })
 
+    mean_average_vol = round(df["Rel Volume"].mean(),5)
+    mean_average_mass = round(df["Rel Weight"].mean(),5)
+
+    pos_share = round(y.sum() / len(y),4)
+    neg_share = round(1 - pos_share,4)
+
     summary = {
         "dataset": os.path.basename(csv_path),
         "n_samples": int(len(df)),
+        "model_type": "LR",
+        "Mean_Rel_Volume":mean_average_vol,
+        "Mean_Rel_Weight":mean_average_mass,
+        "neg_share": neg_share,
+        "pos_share":pos_share,
         "n_features_total": int(n_total_features),
         "label_column": LABEL_COL,
         "cv_folds": N_SPLITS,
         "feature_selection": {
             "method": "SequentialForwardSelection",
             "direction": "forward",
-            "selection_scoring": "roc_auc",
+            "selection_scoring": "mcc",
             "max_features_considered": cap
         },
         "results_by_k": results,

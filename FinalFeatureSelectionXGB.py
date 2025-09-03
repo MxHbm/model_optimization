@@ -1,218 +1,197 @@
-# pip install mlxtend threadpoolctl
-import os, json, math
+# pip install xgboost
+import os
+import json
+import glob
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from threadpoolctl import threadpool_limits
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
-from sklearn.metrics import roc_auc_score, roc_curve
-from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.metrics import make_scorer, matthews_corrcoef
 from xgboost import XGBClassifier
 
-# ----------------- Load & prep -----------------
-basepath = r"C:\Users\mahu123a\Documents\Data\RandomDataGeneration_Gendreau"
-for folder in os.listdir(basepath):
-    if folder not in ["RandomData_4_30_30","RandomData_5_40_40","RandomData_3_20_20"]:
-        typedata = folder.split("RandomData")[0]
-        csv_name = folder + ".csv" 
-        data = pd.read_csv(os.path.join(basepath,folder,csv_name))
-        data.dropna(inplace=True)
-        print(f"opening data: {os.path.join(basepath,folder,csv_name)}")
+# ----------------- CONFIG -----------------
+INPUT_DIR    = r"C:\Users\mahu123a\Documents\Data\RandomDataGeneration_Gendreau"
+OUTPUT_DIR   = os.path.join(os.getcwd(), "FeatureSubsetResultsXGB_JSON")
+LABEL_COL    = "CP Status"
+DROP_COLS    = ["filename", "Route"]     # columns to drop from features
+MAX_FEATURES = 35
+MIN_FEATURES = 5
+N_SPLITS     = 5
+RANDOM_STATE = 42
+N_JOBS       = 16                         # CV/SFS parallelism; keep XGB n_jobs=1
 
-        drop_cols = ["filename", "Route"]
-        labelcol  = "CP Status"
+cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
-        y = data[labelcol].astype(int)
-        X = data.drop(columns=drop_cols + [labelcol])
+scoring = {
+    "accuracy": "accuracy",
+    "f1": "f1",
+    "roc_auc": "roc_auc",
+    "mcc": make_scorer(matthews_corrcoef)
+}
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.30, random_state=42, stratify=y
-        )
+# ----------------- UTIL -----------------
+def safe_colnames(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
+def make_xgb(y: pd.Series) -> XGBClassifier:
+    """Create a single-threaded XGBClassifier with imbalance handling."""
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    scale_pos_weight = neg / max(pos, 1)
 
-        # ----------------- Config -----------------
-        OUTPUT_DIR = f"./fs_output/fs_outputs{typedata}"            # where to save JSON & plots
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        PROJECT_TAG = "xgb_fwd_float_5cv_auc"  # used in filenames
-        MAX_THREADS = 5
+    return XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",           # keeps AUC in training logs; scoring controlled by CV
+        max_depth=15,
+        n_estimators=300,
+        subsample=1.0,
+        colsample_bytree=1.0,
+        random_state=RANDOM_STATE,
+        scale_pos_weight=scale_pos_weight,
+        tree_method="hist",
+        n_jobs=8,                   # IMPORTANT: parallelize at CV/SFS level, not inside model
+        verbosity=1
+    )
 
-        # Limit features searched up to this many (keeps SFS runtime sane)
-        KMAX = min(30, X_train.shape[1])
+def evaluate_subset(X: pd.DataFrame, y: pd.Series, features: list[str], estimator) -> dict:
+    res = cross_validate(
+        estimator,
+        X[features],
+        y,
+        cv=cv,
+        scoring=scoring,
+        n_jobs=N_JOBS,
+        return_train_score=False,
+    )
+    out = {}
+    for key, arr in res.items():
+        if not key.startswith("test_"):
+            continue
+        metric = key.replace("test_", "")
+        arr = np.asarray(arr, dtype=float)
+        out[metric] = {
+            "folds": [float(v) for v in arr],
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+        }
+    return out
 
-        # ----------------- Base model (single-threaded; outer parallelism handles speed) -----------------
-        pos = int((y_train == 1).sum())
-        neg = int((y_train == 0).sum())
-        scale_pos_weight = neg / max(pos, 1)
+def select_features_k(X: pd.DataFrame, y: pd.Series, k: int, metric: str, estimator) -> list[str]:
+    """
+    Sequential forward selection to pick k features optimizing MCC (or other metric if desired).
+    """
+    scoring_fn = make_scorer(matthews_corrcoef) if metric == "mcc" else metric
 
-        base_model = XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="auc",
-            max_depth=10,
-            n_estimators=300,
-            subsample=1.0,
-            colsample_bytree=1.0,
-            random_state=42,
-            scale_pos_weight=scale_pos_weight,
-            n_jobs=1,            # keep model single-threaded
-            verbosity=1,
-            tree_method="hist"
-        )
+    selector = SequentialFeatureSelector(
+        estimator,
+        n_features_to_select=k,
+        direction="forward",
+        scoring=scoring_fn,
+        cv=cv,
+        n_jobs=N_JOBS
+    )
+    selector.fit(X, y)
+    support = selector.get_support(indices=True)
+    return list(X.columns[support])
 
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+def summarize_best(results_by_k: list[dict]) -> dict:
+    best = {}
+    for metric in ["accuracy", "f1", "roc_auc", "mcc"]:
+        best_entry = max(results_by_k, key=lambda d: d["scores"][metric]["mean"])
+        best[metric] = {
+            "k": best_entry["k"],
+            "mean": best_entry["scores"][metric]["mean"],
+            "std": best_entry["scores"][metric]["std"],
+            "features": best_entry["features"]
+        }
+    return best
 
-        # ----------------- Sequential Forward Selection (floating) -----------------
-        with threadpool_limits(limits=MAX_THREADS):
-            sfs = SFS(
-                estimator=base_model,
-                k_features=(1, KMAX),
-                forward=True,
-                floating=True,
-                scoring="roc_auc",
-                cv=cv,
-                n_jobs=MAX_THREADS,
-                verbose=2
-            )
-            sfs = sfs.fit(X_train, y_train)
+# ----------------- MAIN LOOP -----------------
+def process_dataset(csv_path: str) -> dict:
+    df = pd.read_csv(csv_path)
+    df = safe_colnames(df).dropna()
 
-        # Selected features (final step)
-        selected_feats = list(sfs.k_feature_names_)
-        print(f"Selected ({len(selected_feats)}): {selected_feats}")
+    if LABEL_COL not in df.columns:
+        raise ValueError(f"Label column '{LABEL_COL}' not found in {csv_path}")
 
-        # ----------------- Save full metric dict as JSON -----------------
-        metric_dict = sfs.get_metric_dict()
-        # Convert all numpy types and arrays to native python types for JSON
-        def make_jsonable(obj):
-            if isinstance(obj, (np.floating, np.integer)):
-                return obj.item()
-            if isinstance(obj, (np.ndarray,)):
-                return obj.tolist()
-            if isinstance(obj, (list, tuple)):
-                return [make_jsonable(x) for x in obj]
-            if isinstance(obj, dict):
-                return {k: make_jsonable(v) for k,v in obj.items()}
-            return obj
+    y = df[LABEL_COL].astype(int)
+    X = df.drop(columns=[LABEL_COL] + [c for c in DROP_COLS if c in df.columns])
 
-        metric_dict_json = make_jsonable(metric_dict)
-        json_path = os.path.join(OUTPUT_DIR, f"{PROJECT_TAG}_sfs_metrics.json")
-        with open(json_path, "w") as f:
-            json.dump(metric_dict_json, f, indent=2)
-        print(f"Saved SFS metrics JSON -> {json_path}")
+    # ensure binary labels {0,1}
+    unique_y = sorted(y.unique().tolist())
+    if len(unique_y) != 2:
+        raise ValueError(f"Expecting binary target in {csv_path}; got classes {unique_y}")
 
-        # ----------------- Refit final model; 5-fold CV AUROC summary -----------------
-        with threadpool_limits(limits=MAX_THREADS):
-            base_model.fit(X_train[selected_feats], y_train)
-            cv_scores = cross_val_score(base_model, X_train[selected_feats], y_train,
-                                        scoring="roc_auc", cv=cv, n_jobs=MAX_THREADS)
-        print(f"Final (selected) 5-fold CV AUROC: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+    # model (built per-dataset to get correct scale_pos_weight)
+    base_estimator = make_xgb(y)
 
-        # ----------------- ROC curves on TEST for every SFS step -----------------
-        # SFS steps are 1..len(metric_dict). For each, we get the feature names, fit on train, predict proba on test.
-        roc_info = []  # list of dicts with 'k', 'features', 'auc', 'fpr', 'tpr'
-        with threadpool_limits(limits=MAX_THREADS):
-            for k in sorted(metric_dict.keys(), key=int):
-                feat_names = list(metric_dict[k]['feature_names'])
-                # Fit & predict
-                model_k = XGBClassifier(**{**base_model.get_params()})  # clone with same params
-                model_k.fit(X_train[feat_names], y_train)
-                y_prob = model_k.predict_proba(X_test[feat_names])[:, 1]
-                auc_k = roc_auc_score(y_test, y_prob)
-                fpr_k, tpr_k, _ = roc_curve(y_test, y_prob)
-                roc_info.append({
-                    "k": int(k),
-                    "features": feat_names,
-                    "auc": float(auc_k),
-                    "fpr": fpr_k.tolist(),
-                    "tpr": tpr_k.tolist()
-                })
+    n_total_features = X.shape[1]
+    cap = min(MAX_FEATURES, n_total_features)
 
-        # Save all ROC curves & subsets to JSON
-        roc_json_path = os.path.join(OUTPUT_DIR, f"{PROJECT_TAG}_test_roc_all_steps.json")
-        with open(roc_json_path, "w") as f:
-            json.dump(roc_info, f, indent=2)
-        print(f"Saved all test ROC curves JSON -> {roc_json_path}")
+    results = []
+    for k in range(MIN_FEATURES, cap + 1):
+        features_k = select_features_k(X, y, k, "mcc", base_estimator)
+        scores_k   = evaluate_subset(X, y, features_k, base_estimator)
+        results.append({
+            "k": k,
+            "features": features_k,
+            "scores": scores_k
+        })
 
-        # ----------------- Combined ROC plot (all in one; best AUROC emphasized) -----------------
-        # Find best by AUROC
-        best_idx = int(np.argmax([r["auc"] for r in roc_info]))
-        best = roc_info[best_idx]
+    # optional summary stats (keep your existing keys)
+    mean_average_vol  = float(round(df["Rel Volume"].mean(), 5))  if "Rel Volume"  in df.columns else None
+    mean_average_mass = float(round(df["Rel Weight"].mean(), 5))  if "Rel Weight"  in df.columns else None
+    pos_share = round(float((y == 1).mean()), 4)
+    neg_share = round(1 - pos_share, 4)
 
-        plt.figure(figsize=(8, 7))
-        # Plot others first (thin & semi-transparent)
-        for i, r in enumerate(roc_info):
-            if i == best_idx: 
-                continue
-            plt.plot(r["fpr"], r["tpr"], linewidth=1, alpha=0.4, label=f'k={r["k"]} AUC={r["auc"]:.3f}')
-        # Plot best on top (thick line)
-        plt.plot(best["fpr"], best["tpr"], linewidth=3, label=f'BEST k={best["k"]} AUC={best["auc"]:.3f}')
-        plt.plot([0,1],[0,1], linestyle="--")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curves (Test) for All SFS Steps")
-        plt.legend(loc="lower right", fontsize=8, ncol=1, frameon=True)
-        combined_plot_path = os.path.join(OUTPUT_DIR, f"{PROJECT_TAG}_test_roc_all_steps_combined.png")
-        plt.tight_layout()
-        plt.savefig(combined_plot_path, dpi=200)
-        plt.close()
-        print(f"Saved combined ROC plot -> {combined_plot_path}")
+    summary = {
+        "dataset": os.path.basename(csv_path),
+        "n_samples": int(len(df)),
+        "model_type": "XGB",
+        "Mean_Rel_Volume": mean_average_vol,
+        "Mean_Rel_Weight": mean_average_mass,
+        "neg_share": neg_share,
+        "pos_share": pos_share,
+        "n_features_total": int(n_total_features),
+        "label_column": LABEL_COL,
+        "cv_folds": N_SPLITS,
+        "feature_selection": {
+            "method": "SequentialForwardSelection",
+            "direction": "forward",
+            "selection_scoring": "mcc",
+            "max_features_considered": cap
+        },
+        "results_by_k": results,
+        "best_by_metric": summarize_best(results)
+    }
+    return summary
 
-        # ----------------- Individual ROC plots per subset -----------------
-        for r in roc_info:
-            plt.figure(figsize=(5, 4))
-            plt.plot(r["fpr"], r["tpr"], linewidth=2, label=f'k={r["k"]} AUC={r["auc"]:.3f}')
-            plt.plot([0,1],[0,1], linestyle="--")
-            plt.xlabel("False Positive Rate")
-            plt.ylabel("True Positive Rate")
-            plt.title(f"ROC (Test) | k={r['k']}")
-            plt.legend(loc="lower right")
-            out_path = os.path.join(OUTPUT_DIR, f"{PROJECT_TAG}_test_roc_k{r['k']:02d}.png")
-            plt.tight_layout()
-            plt.savefig(out_path, dpi=200)
-            plt.close()
-        print(f"Saved individual ROC plots in -> {OUTPUT_DIR}")
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for foldername in os.listdir(INPUT_DIR):
+        csv_files = sorted(glob.glob(str(Path(INPUT_DIR, foldername) / "*.csv")))
+        if not csv_files:
+            print(f"No CSV files found in: {Path(INPUT_DIR, foldername)}")
+            continue
 
-        # ----------------- OPTIONAL: Subplot grid with BEST in the MIDDLE -----------------
-        # If you'd like a grid of small multiples with the best curve centered:
-        def subplot_grid_with_center_best(roc_info, grid_cols=3):
-            n = len(roc_info)
-            rows = math.ceil(n / grid_cols)
-            # The "center" index for (rows x cols) grid:
-            center_row = rows // 2
-            center_col = grid_cols // 2
-            # Sort so best goes to center position:
-            order = sorted(range(n), key=lambda i: roc_info[i]["auc"])  # ascending
-            best_i = int(np.argmax([r["auc"] for r in roc_info]))
-            # Move the best index to the middle of the ordered list
-            center_pos = center_row * grid_cols + center_col
-            if center_pos < len(order):
-                order.remove(best_i)
-                order.insert(center_pos, best_i)
-            else:
-                # if grid has more cells than items, we still ensure best is last slot
-                order.remove(best_i)
-                order.append(best_i)
+        for csv_path in csv_files:
+            try:
+                print(f"Processing: {csv_path}")
+                summary = process_dataset(csv_path)
 
-            # Plot
-            fig, axes = plt.subplots(rows, grid_cols, figsize=(grid_cols*3, rows*3))
-            axes = np.atleast_2d(axes)
-            for ax_i in range(rows * grid_cols):
-                r = roc_info[ order[ax_i] ] if ax_i < n else None
-                ax = axes[ax_i // grid_cols, ax_i % grid_cols]
-                ax.plot([0,1],[0,1], linestyle="--")
-                if r is not None:
-                    lw = 3 if order[ax_i] == best_i else 1
-                    alpha = 1.0 if order[ax_i] == best_i else 0.6
-                    ax.plot(r["fpr"], r["tpr"], linewidth=lw, alpha=alpha)
-                    ax.set_title(f'k={r["k"]} | AUC={r["auc"]:.3f}', fontsize=9)
-                ax.set_xlim(0,1); ax.set_ylim(0,1)
-                if (ax_i // grid_cols) == rows-1:
-                    ax.set_xlabel("FPR")
-                if (ax_i % grid_cols) == 0:
-                    ax.set_ylabel("TPR")
-            plt.tight_layout()
-            grid_path = os.path.join(OUTPUT_DIR, f"{PROJECT_TAG}_test_roc_grid_best_center.png")
-            plt.savefig(grid_path, dpi=200)
-            plt.close()
-            print(f"Saved grid ROC plot (best centered) -> {grid_path}")
+                out_name = os.path.splitext(os.path.basename(csv_path))[0] + "_feature_subsets.json"
+                out_path = str(Path(OUTPUT_DIR) / out_name)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2)
+                print(f"Saved: {out_path}")
+            except Exception as e:
+                print(f"[ERROR] {csv_path}: {e}")
 
-        # Call it if you want the grid:
-        subplot_grid_with_center_best(roc_info, grid_cols=3)
+if __name__ == "__main__":
+    main()
